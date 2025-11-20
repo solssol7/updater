@@ -7,25 +7,22 @@ from datetime import datetime
 from io import StringIO
 
 # --- 환경 변수 및 설정 ---
-# GitHub Secrets에서 가져옴
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# 외부 PostgreSQL DB 접속 정보 (DBeaver 이미지 기반)
+# 외부 PostgreSQL DB 접속 정보
 DB_HOST = "pg-3ae9p5.vpc-cdb-kr.ntruss.com"
 DB_PORT = "5432"
 DB_NAME = "qmarket"
 DB_USER = "hansol"
 
 # --- 배치 및 임시 파일 설정 ---
-BATCH_SIZE = 1000 # 한 번에 보낼 행 수 (1000~2000 추천)
+BATCH_SIZE = 1000
 TEMP_DIR = "/tmp" 
 
-# --- SQL 쿼리 정의 및 Supabase 테이블 이름 매핑 (수정 완료) ---
-# key: Supabase 테이블명, value: SQL 쿼리 및 Upsert 충돌 방지 컬럼 설정
+# --- SQL 쿼리 정의 및 Supabase 테이블 이름 매핑 ---
 QUERIES = {
-    # 1. 사용자 정보 (user_id를 기준으로 업데이트)
     "users": {
         "sql": """
             WITH latest_user_addresses AS (
@@ -54,10 +51,11 @@ QUERIES = {
             WHERE u.user_status = 'ACTIVE'
             AND (m.enabled = true AND m.closed != '연중휴무');
         """,
-        "on_conflict": "user_id" # Supabase 테이블의 Primary Key와 일치해야 함
+        "on_conflict": "user_id",
+        "delete_orphans": True,  # 소스에 없는 데이터 삭제
+        "key_columns": ["user_id"]  # 삭제 시 비교할 키
     },
     
-    # 2. 쿠폰 정보 (user_id를 기준으로 업데이트)
     "coupons": {
         "sql": """
             SELECT
@@ -72,11 +70,12 @@ QUERIES = {
             GROUP BY u.user_id
             ORDER BY valid_coupon_count DESC;
         """,
-        "on_conflict": "user_id"
+        "on_conflict": "user_id",
+        "delete_orphans": True,
+        "key_columns": ["user_id"]
     },
     
-    # 3. 주문/결제 정보 (order_id를 기준으로 업데이트)
-    "orders": { # 테이블 이름: orders로 확정
+    "orders": {
         "sql": """
             SELECT
                 o.user_id, o.order_id, o.created_date AS order_date,
@@ -91,7 +90,9 @@ QUERIES = {
             GROUP BY o.user_id, o.order_id, o.created_date
             ORDER BY o.user_id, o.created_date;
         """,
-        "on_conflict": "order_id" # Supabase 테이블의 Primary Key와 일치해야 함
+        "on_conflict": "user_id,order_id",  # 복합키로 수정
+        "delete_orphans": True,
+        "key_columns": ["user_id", "order_id"]
     }
 }
 
@@ -102,7 +103,6 @@ def extract_db_to_csv(query_config, temp_filename):
 
     print(f"\n--- [1단계] {temp_filename} 추출 시작 ---")
     try:
-        # DB 연결
         conn = psycopg2.connect(
             host=DB_HOST, database=DB_NAME, user=DB_USER, 
             password=DB_PASSWORD, port=DB_PORT
@@ -112,14 +112,11 @@ def extract_db_to_csv(query_config, temp_filename):
         
         filepath = os.path.join(TEMP_DIR, temp_filename)
         
-        # CSV 파일 작성
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            # 컬럼명(Header) 작성
             if cursor.description:
                 headers = [desc[0] for desc in cursor.description]
                 writer.writerow(headers)
-            # 데이터 작성
             writer.writerows(cursor)
             
         cursor.close()
@@ -136,33 +133,91 @@ def _send_batch(data, table_name, on_conflict_col):
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal" # 응답 최소화
+        "Prefer": "resolution=merge-duplicates"  # upsert 동작 명시
     }
     
-    # on_conflict 파라미터를 추가하여 UPSERT 구현
     params = {}
     if on_conflict_col:
         params['on_conflict'] = on_conflict_col
     
     url = f"{SUPABASE_URL}/rest/v1/{table_name}"
-    
-    # POST 메소드를 사용하고 on_conflict 파라미터를 사용하면 Upsert가 됩니다.
     response = requests.post(url, headers=headers, params=params, data=json.dumps(data))
     
-    if 200 <= response.status_code < 300: # 201 Created, 200 OK 등 성공 코드
+    if 200 <= response.status_code < 300:
         return True
     else:
         print(f"⚠️ {table_name} Upsert 실패 (Code {response.status_code}): {response.text}")
         return False
 
-def upload_csv_to_supabase(table_name, filepath, on_conflict_col):
-    """CSV 파일을 읽어 Supabase REST API를 통해 배치 Upsert"""
+def delete_orphaned_records(table_name, key_columns, current_keys):
+    """Supabase에서 소스 DB에 없는 레코드 삭제"""
+    print(f"\n--- [3단계] {table_name}에서 orphan 레코드 삭제 시작 ---")
+    
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        # 1. Supabase에서 현재 모든 키 조회
+        url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+        select_cols = ",".join(key_columns)
+        params = {"select": select_cols}
+        
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            print(f"⚠️ 기존 데이터 조회 실패: {response.text}")
+            return
+        
+        existing_records = response.json()
+        
+        # 2. 삭제할 키 찾기
+        existing_keys = set()
+        for record in existing_records:
+            key_tuple = tuple(str(record[col]) for col in key_columns)
+            existing_keys.add(key_tuple)
+        
+        keys_to_delete = existing_keys - current_keys
+        
+        if not keys_to_delete:
+            print(f"✅ 삭제할 orphan 레코드 없음")
+            return
+        
+        print(f"🗑️  {len(keys_to_delete)}개의 orphan 레코드 발견, 삭제 중...")
+        
+        # 3. 삭제 실행
+        deleted_count = 0
+        for key_tuple in keys_to_delete:
+            # 복합키 조건 생성
+            conditions = []
+            for i, col in enumerate(key_columns):
+                conditions.append(f"{col}=eq.{key_tuple[i]}")
+            
+            delete_url = f"{url}?{'&'.join(conditions)}"
+            del_response = requests.delete(delete_url, headers=headers)
+            
+            if 200 <= del_response.status_code < 300:
+                deleted_count += 1
+            else:
+                print(f"⚠️ 삭제 실패 {key_tuple}: {del_response.text}")
+        
+        print(f"✅ {deleted_count}개 레코드 삭제 완료")
+        
+    except Exception as e:
+        print(f"❌ Orphan 삭제 중 오류: {e}")
+
+def upload_csv_to_supabase(table_name, filepath, config):
+    """CSV 파일을 읽어 Supabase REST API를 통해 배치 Upsert 및 orphan 삭제"""
+    on_conflict_col = config.get("on_conflict")
     print(f"\n--- [2단계] {table_name} 업로드 시작 (배치 크기: {BATCH_SIZE}) ---")
     
     if not os.path.exists(filepath):
         print(f"❌ 파일 경로 오류: {filepath}를 찾을 수 없습니다.")
         return
 
+    current_keys = set()  # 현재 소스 DB에 있는 키들
+    
     try:
         with open(filepath, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
@@ -170,14 +225,18 @@ def upload_csv_to_supabase(table_name, filepath, on_conflict_col):
             total_count = 0
             
             for row in reader:
-                # PostgreSQL 배열 타입은 Supabase 스키마에 따라 문자열로 전송됩니다.
                 data_batch.append(row)
+                
+                # 키 추적
+                if config.get("delete_orphans") and config.get("key_columns"):
+                    key_tuple = tuple(str(row[col]) for col in config["key_columns"])
+                    current_keys.add(key_tuple)
                 
                 if len(data_batch) >= BATCH_SIZE:
                     if _send_batch(data_batch, table_name, on_conflict_col):
                         total_count += len(data_batch)
                         print(f"✅ {len(data_batch)}개 배치 성공. 누적: {total_count}")
-                        data_batch = [] # 초기화
+                        data_batch = []
                     else:
                         print(f"❌ {table_name} 업로드 중단됨.")
                         return
@@ -190,11 +249,14 @@ def upload_csv_to_supabase(table_name, filepath, on_conflict_col):
                 else:
                     print(f"❌ {table_name} 최종 업로드 중단됨.")
                     return
+        
+        # Orphan 레코드 삭제
+        if config.get("delete_orphans") and config.get("key_columns"):
+            delete_orphaned_records(table_name, config["key_columns"], current_keys)
 
     except Exception as e:
         print(f"❌ {table_name} 업로드 중 알 수 없는 오류: {e}")
     finally:
-        # 임시 파일 삭제
         if os.path.exists(filepath):
             os.remove(filepath)
             print(f"✅ 임시 파일 삭제: {filepath}")
@@ -208,13 +270,12 @@ def run_all_syncs():
         # 1. 추출
         filepath = extract_db_to_csv(config, temp_filename)
         
-        # 2. 업로드
+        # 2. 업로드 및 삭제
         if filepath:
-            on_conflict_col = config.get("on_conflict")
-            if not on_conflict_col:
+            if not config.get("on_conflict"):
                 print(f"⚠️ {table_name} 테이블의 'on_conflict' 키가 정의되지 않아 **Insert만** 시도합니다.")
             
-            upload_csv_to_supabase(table_name, filepath, on_conflict_col)
+            upload_csv_to_supabase(table_name, filepath, config)
 
 if __name__ == "__main__":
     if not (SUPABASE_URL and SUPABASE_KEY and DB_PASSWORD):
