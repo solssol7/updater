@@ -1,0 +1,29 @@
+name: Data Sync to Supabase
+
+on:
+  schedule:
+    # 매일 오전 4시 UTC에 실행 (KST는 +9시간, 즉 오후 1시)
+    - cron: '0 0 * * *' 
+  workflow_dispatch: # 수동 실행을 허용
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        
+    - name: Install dependencies
+      run: |
+        pip install psycopg2-binary requests
+        
+    - name: Run synchronization script
+      env:
+        # GitHub Secrets에 등록한 변수를 사용합니다.
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: |
+        python sync_data.py
